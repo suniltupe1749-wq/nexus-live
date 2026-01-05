@@ -1,53 +1,23 @@
 import os
-import time
+import time  # Added for rate limiting
 import chromadb
 import google.generativeai as genai
 from pymongo import MongoClient
-from chromadb import Documents, EmbeddingFunction, Embeddings
+from chromadb.utils import embedding_functions
+from dotenv import load_dotenv
 import uuid
-import random
 
-# 1. Setup Google Gemini
-api_key = os.getenv("AIzaSyBUM7or5qz9DHa6I_ZezaAU0i26dIT9EDs")
+# Load Secrets
+# (Replace with your actual key if not using .env)
+api_key = "AIzaSyAqBO1T6qtzg-oHi65hdrX8HyZj7Oy6FOY"
 genai.configure(api_key=api_key)
-
-# 2. STRICT Rate Limit Embedding Function
-class GeminiEmbeddingFunction(EmbeddingFunction):
-    def __call__(self, input: Documents) -> Embeddings:
-        model = "models/embedding-001"
-        embeddings = []
-        for text in input:
-            # Retry loop for 429 Errors
-            for attempt in range(5):
-                try:
-                    response = genai.embed_content(
-                        model=model,
-                        content=text,
-                        task_type="retrieval_document"
-                    )
-                    embeddings.append(response['embedding'])
-                    
-                    # CRITICAL: Wait 4 seconds between every single chunk
-                    # This prevents the "Speeding Ticket" (429)
-                    time.sleep(4) 
-                    break
-                except Exception as e:
-                    # If we still hit a limit, wait 10, 20, 30 seconds...
-                    wait_time = (2 ** attempt) * 5
-                    print(f"⚠️ Rate Limit Hit. Cooling down for {wait_time}s...")
-                    time.sleep(wait_time)
-        return embeddings
 
 class DatabaseManager:
     def __init__(self):
-        # MongoDB Connection
+        # 1. MongoDB (Tables)
         try:
-            mongo_uri = os.getenv("MONGO_URI")
-            if not mongo_uri: 
-                mongo_uri = "mongodb://localhost:27017/"
-            
-            self.mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-            self.mongo_client.server_info() 
+            self.mongo_client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
+            self.mongo_client.server_info()
             self.mongo_db = self.mongo_client["full_project_db"]
             self.table_col = self.mongo_db["tables"]
             print("✅ MongoDB Connected")
@@ -55,11 +25,12 @@ class DatabaseManager:
             print("⚠️ MongoDB not found. Tables will be text-only.")
             self.table_col = None
 
-        # ChromaDB Connection
+        # 2. ChromaDB (Vectors)
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
-        
-        self.ef = GeminiEmbeddingFunction()
-        
+        self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2",
+            device="cpu"
+        )
         self.collection = self.chroma_client.get_or_create_collection(
             name="enterprise_data",
             embedding_function=self.ef
@@ -72,21 +43,18 @@ class DatabaseManager:
     def save_table(self, html, summary, filename, page):
         mongo_id = "N/A"
         if self.table_col is not None:
-            try:
-                res = self.table_col.insert_one({"html": html, "source": filename, "page": page})
-                mongo_id = str(res.inserted_id)
-            except:
-                pass
+            res = self.table_col.insert_one({"html": html, "source": filename, "page": page})
+            mongo_id = str(res.inserted_id)
         
         meta = {"source": filename, "page": page, "type": "table", "mongo_id": mongo_id}
         self.save_chunk(f"Table Data: {summary}", meta)
 
     def ask_ai(self, user_query):
-        # Search Vector DB
-        try:
-            results = self.collection.query(query_texts=[user_query], n_results=5)
-        except Exception as e:
-            return "⚠️ Database error. Please try again.", [], []
+        # Pause briefly to avoid 429 errors
+        time.sleep(1)
+
+        # Search Database
+        results = self.collection.query(query_texts=[user_query], n_results=5)
         
         context_parts = []
         retrieved_images = []
@@ -99,38 +67,34 @@ class DatabaseManager:
                 
                 if dtype == 'image':
                     img_path = meta.get('image_path')
+                    
+                    # --- FIX 1: Prevent Duplicate Images ---
                     if img_path not in retrieved_images:
                         retrieved_images.append(img_path)
+                        # We still add the text context so the AI knows about it
                         context_parts.append(f"[Found Image: {doc}]")
 
                 elif dtype == 'table':
                     mongo_id = meta.get('mongo_id')
                     if self.table_col is not None and mongo_id != "N/A":
                         from bson.objectid import ObjectId
-                        try:
-                            t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
-                            if t_doc and t_doc["html"] not in retrieved_tables:
-                                retrieved_tables.append(t_doc["html"])
-                                context_parts.append(f"[Found Table: {doc}]")
-                        except:
-                            pass
+                        t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
+                        
+                        # --- FIX 2: Prevent Duplicate Tables ---
+                        if t_doc and t_doc["html"] not in retrieved_tables:
+                            retrieved_tables.append(t_doc["html"])
+                            context_parts.append(f"[Found Table: {doc}]")
                 else:
                     context_parts.append(f"{doc}")
 
         if not context_parts: return "No info found.", [], []
 
-        # SWITCHING BACK TO 1.5 FLASH (Most Stable for Free Tier)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
-        
+        # Generate Answer
         try:
-            # Retry logic for Chat
-            for attempt in range(3):
-                try:
-                    response = model.generate_content(prompt)
-                    return response.text, retrieved_images, retrieved_tables
-                except Exception as e:
-                    time.sleep(5) # Wait 5 seconds if chat fails
-            return "⚠️ Server is busy (Rate Limit). Please wait 1 minute.", [], []
+            # Using 2.5 Flash as it is currently the most stable free model
+            model = genai.GenerativeModel('gemini-flash-latest')
+            prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
+            response = model.generate_content(prompt)
+            return response.text, retrieved_images, retrieved_tables
         except Exception as e:
-            return f"AI Error: {e}", [], []
+            return f"Error: {e}", [], []
