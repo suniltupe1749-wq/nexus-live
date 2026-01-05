@@ -9,7 +9,7 @@ import uuid
 
 # Load Secrets
 # (Replace with your actual key if not using .env)
-api_key = "AIzaSyAqBO1T6qtzg-oHi65hdrX8HyZj7Oy6FOY"
+api_key = "GOOGLE_API_KEY"
 genai.configure(api_key=api_key)
 
 class DatabaseManager:
@@ -98,3 +98,4 @@ class DatabaseManager:
             return response.text, retrieved_images, retrieved_tables
         except Exception as e:
             return f"Error: {e}", [], []
+
