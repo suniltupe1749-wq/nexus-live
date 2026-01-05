@@ -3,7 +3,8 @@ google-generativeai
 chromadb
 pymongo
 python-dotenv
-unstructured
+unstructured[pdf]
 pdf2image
 pytesseract
 tiktoken
+pdfminer.six
