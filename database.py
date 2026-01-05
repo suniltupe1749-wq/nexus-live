@@ -10,14 +10,15 @@ import uuid
 api_key = os.getenv("AIzaSyBUM7or5qz9DHa6I_ZezaAU0i26dIT9EDs")
 genai.configure(api_key=api_key)
 
-# 2. Define a Lightweight Embedding Function (Uses Google Cloud instead of RAM)
+# 2. Define a Lightweight Embedding Function
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
+        # Using the standard embedding model
         model = "models/embedding-001"
         embeddings = []
         for text in input:
-            # Retry logic for embeddings to prevent crashes
-            for _ in range(3):
+            # Retry logic with SLOWER intervals to avoid 429 Errors
+            for attempt in range(3):
                 try:
                     response = genai.embed_content(
                         model=model,
@@ -25,10 +26,10 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
                         task_type="retrieval_document"
                     )
                     embeddings.append(response['embedding'])
-                    time.sleep(0.5) # Be polite to the API
+                    time.sleep(1.5) # Wait 1.5 seconds between requests (CRITICAL FIX)
                     break
                 except Exception as e:
-                    time.sleep(1)
+                    time.sleep(3) # If error, wait 3 seconds before retry
         return embeddings
 
 class DatabaseManager:
@@ -40,7 +41,6 @@ class DatabaseManager:
                 mongo_uri = "mongodb://localhost:27017/"
                 
             self.mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
-            # Trigger connection check
             self.mongo_client.server_info() 
             self.mongo_db = self.mongo_client["full_project_db"]
             self.table_col = self.mongo_db["tables"]
@@ -49,10 +49,8 @@ class DatabaseManager:
             print("⚠️ MongoDB not found. Tables will be text-only.")
             self.table_col = None
 
-        # ChromaDB Connection (Vector Store)
+        # ChromaDB Connection
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
-        
-        # USE GOOGLE FOR EMBEDDINGS (Saves RAM)
         self.ef = GeminiEmbeddingFunction()
         
         self.collection = self.chroma_client.get_or_create_collection(
@@ -77,8 +75,6 @@ class DatabaseManager:
         self.save_chunk(f"Table Data: {summary}", meta)
 
     def ask_ai(self, user_query):
-        time.sleep(1) # Rate limit buffer
-        
         # Search Vector DB
         results = self.collection.query(query_texts=[user_query], n_results=5)
         
@@ -99,7 +95,7 @@ class DatabaseManager:
 
                 elif dtype == 'table':
                     mongo_id = meta.get('mongo_id')
-                    if self.table_col is not None and mongo_id != "N/A" and mongo_id != "None":
+                    if self.table_col is not None and mongo_id != "N/A":
                         from bson.objectid import ObjectId
                         try:
                             t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
@@ -111,10 +107,10 @@ class DatabaseManager:
                 else:
                     context_parts.append(f"{doc}")
 
-        if not context_parts: return "No info found in documents.", [], []
+        if not context_parts: return "No info found.", [], []
 
-        # Generate Answer using Gemini
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # SWITCHED TO STABLE MODEL (gemini-1.5-flash)
+        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
         
         try:
