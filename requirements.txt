@@ -9,3 +9,5 @@ pytesseract
 tiktoken
 pdfminer.six
 opencv-python-headless
+sentence-transformers
+
