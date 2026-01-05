@@ -1,23 +1,47 @@
 import os
-import time  # Added for rate limiting
+import time
 import chromadb
 import google.generativeai as genai
 from pymongo import MongoClient
-from chromadb.utils import embedding_functions
-from dotenv import load_dotenv
+from chromadb import Documents, EmbeddingFunction, Embeddings
 import uuid
 
-# Load Secrets
-# (Replace with your actual key if not using .env)
-api_key = "AIzaSyBUM7or5qz9DHa6I_ZezaAU0i26dIT9EDs"
+# 1. Setup Google Gemini
+api_key = os.getenv("AIzaSyBUM7or5qz9DHa6I_ZezaAU0i26dIT9EDs")
 genai.configure(api_key=api_key)
+
+# 2. Define a Lightweight Embedding Function (Uses Google Cloud instead of RAM)
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    def __call__(self, input: Documents) -> Embeddings:
+        model = "models/embedding-001"
+        embeddings = []
+        for text in input:
+            # Retry logic for embeddings to prevent crashes
+            for _ in range(3):
+                try:
+                    response = genai.embed_content(
+                        model=model,
+                        content=text,
+                        task_type="retrieval_document"
+                    )
+                    embeddings.append(response['embedding'])
+                    time.sleep(0.5) # Be polite to the API
+                    break
+                except Exception as e:
+                    time.sleep(1)
+        return embeddings
 
 class DatabaseManager:
     def __init__(self):
-        # 1. MongoDB (Tables)
+        # MongoDB Connection
         try:
-            self.mongo_client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
-            self.mongo_client.server_info()
+            mongo_uri = os.getenv("MONGO_URI")
+            if not mongo_uri: 
+                mongo_uri = "mongodb://localhost:27017/"
+                
+            self.mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+            # Trigger connection check
+            self.mongo_client.server_info() 
             self.mongo_db = self.mongo_client["full_project_db"]
             self.table_col = self.mongo_db["tables"]
             print("✅ MongoDB Connected")
@@ -25,12 +49,12 @@ class DatabaseManager:
             print("⚠️ MongoDB not found. Tables will be text-only.")
             self.table_col = None
 
-        # 2. ChromaDB (Vectors)
+        # ChromaDB Connection (Vector Store)
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
-        self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2",
-            device="cpu"
-        )
+        
+        # USE GOOGLE FOR EMBEDDINGS (Saves RAM)
+        self.ef = GeminiEmbeddingFunction()
+        
         self.collection = self.chroma_client.get_or_create_collection(
             name="enterprise_data",
             embedding_function=self.ef
@@ -43,17 +67,19 @@ class DatabaseManager:
     def save_table(self, html, summary, filename, page):
         mongo_id = "N/A"
         if self.table_col is not None:
-            res = self.table_col.insert_one({"html": html, "source": filename, "page": page})
-            mongo_id = str(res.inserted_id)
+            try:
+                res = self.table_col.insert_one({"html": html, "source": filename, "page": page})
+                mongo_id = str(res.inserted_id)
+            except:
+                pass
         
         meta = {"source": filename, "page": page, "type": "table", "mongo_id": mongo_id}
         self.save_chunk(f"Table Data: {summary}", meta)
 
     def ask_ai(self, user_query):
-        # Pause briefly to avoid 429 errors
-        time.sleep(1)
-
-        # Search Database
+        time.sleep(1) # Rate limit buffer
+        
+        # Search Vector DB
         results = self.collection.query(query_texts=[user_query], n_results=5)
         
         context_parts = []
@@ -67,34 +93,32 @@ class DatabaseManager:
                 
                 if dtype == 'image':
                     img_path = meta.get('image_path')
-                    
-                    # --- FIX 1: Prevent Duplicate Images ---
                     if img_path not in retrieved_images:
                         retrieved_images.append(img_path)
-                        # We still add the text context so the AI knows about it
                         context_parts.append(f"[Found Image: {doc}]")
 
                 elif dtype == 'table':
                     mongo_id = meta.get('mongo_id')
-                    if self.table_col is not None and mongo_id != "N/A":
+                    if self.table_col is not None and mongo_id != "N/A" and mongo_id != "None":
                         from bson.objectid import ObjectId
-                        t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
-                        
-                        # --- FIX 2: Prevent Duplicate Tables ---
-                        if t_doc and t_doc["html"] not in retrieved_tables:
-                            retrieved_tables.append(t_doc["html"])
-                            context_parts.append(f"[Found Table: {doc}]")
+                        try:
+                            t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
+                            if t_doc and t_doc["html"] not in retrieved_tables:
+                                retrieved_tables.append(t_doc["html"])
+                                context_parts.append(f"[Found Table: {doc}]")
+                        except:
+                            pass
                 else:
                     context_parts.append(f"{doc}")
 
-        if not context_parts: return "No info found.", [], []
+        if not context_parts: return "No info found in documents.", [], []
 
-        # Generate Answer
+        # Generate Answer using Gemini
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
+        
         try:
-            # Using 2.5 Flash as it is currently the most stable free model
-            model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
             response = model.generate_content(prompt)
             return response.text, retrieved_images, retrieved_tables
         except Exception as e:
-            return f"Error: {e}", [], []
+            return f"AI Error: {e}", [], []
