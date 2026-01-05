@@ -5,20 +5,20 @@ import google.generativeai as genai
 from pymongo import MongoClient
 from chromadb import Documents, EmbeddingFunction, Embeddings
 import uuid
+import random
 
 # 1. Setup Google Gemini
 api_key = os.getenv("AIzaSyBUM7or5qz9DHa6I_ZezaAU0i26dIT9EDs")
 genai.configure(api_key=api_key)
 
-# 2. Define a Lightweight Embedding Function
+# 2. Smart Embedding Function (Prevents 429 Errors)
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
-        # Using the standard embedding model (Stable)
         model = "models/embedding-001"
         embeddings = []
         for text in input:
-            # Retry logic to avoid crashes
-            for attempt in range(3):
+            # Try up to 5 times if Google is busy
+            for attempt in range(5):
                 try:
                     response = genai.embed_content(
                         model=model,
@@ -26,21 +26,26 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
                         task_type="retrieval_document"
                     )
                     embeddings.append(response['embedding'])
-                    time.sleep(1.0) # Wait 1 second (Rate Limit Safety)
+                    
+                    # SUCCESS: Wait 2 seconds to be safe
+                    time.sleep(2) 
                     break
                 except Exception as e:
-                    time.sleep(2)
+                    # FAILURE: Wait longer each time (2s, 4s, 8s...)
+                    wait_time = (2 ** attempt) + 1
+                    print(f"⚠️ Google is busy. Waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
         return embeddings
 
 class DatabaseManager:
     def __init__(self):
-        # MongoDB Connection
+        # MongoDB Connection with Timeout (Prevents hanging)
         try:
             mongo_uri = os.getenv("MONGO_URI")
             if not mongo_uri: 
                 mongo_uri = "mongodb://localhost:27017/"
-                
-            self.mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+            
+            self.mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
             self.mongo_client.server_info() 
             self.mongo_db = self.mongo_client["full_project_db"]
             self.table_col = self.mongo_db["tables"]
@@ -52,6 +57,7 @@ class DatabaseManager:
         # ChromaDB Connection
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
         
+        # Initialize the Smart Embeddings
         self.ef = GeminiEmbeddingFunction()
         
         self.collection = self.chroma_client.get_or_create_collection(
@@ -77,7 +83,10 @@ class DatabaseManager:
 
     def ask_ai(self, user_query):
         # Search Vector DB
-        results = self.collection.query(query_texts=[user_query], n_results=5)
+        try:
+            results = self.collection.query(query_texts=[user_query], n_results=5)
+        except Exception as e:
+            return "⚠️ Database is warming up. Please try again in 10 seconds.", [], []
         
         context_parts = []
         retrieved_images = []
@@ -110,13 +119,19 @@ class DatabaseManager:
 
         if not context_parts: return "No info found.", [], []
 
-        # --- THE CHANGE IS HERE ---
-        # Using the "8b" model (Fastest Google Model)
-        model = genai.GenerativeModel('gemini-1.5-flash-8b') 
+        # --- THE BEST MODEL ---
+        # Using gemini-1.5-flash (Stable, High Limits)
+        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
         
         try:
-            response = model.generate_content(prompt)
-            return response.text, retrieved_images, retrieved_tables
+            # Smart Retry for Answer Generation too
+            for attempt in range(3):
+                try:
+                    response = model.generate_content(prompt)
+                    return response.text, retrieved_images, retrieved_tables
+                except Exception as e:
+                    time.sleep(2)
+            return "⚠️ Server is busy. Please ask again in a moment.", [], []
         except Exception as e:
             return f"AI Error: {e}", [], []
