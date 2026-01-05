@@ -13,11 +13,11 @@ genai.configure(api_key=api_key)
 # 2. Define a Lightweight Embedding Function
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
-        # Using the standard embedding model
+        # Using the standard embedding model (Stable)
         model = "models/embedding-001"
         embeddings = []
         for text in input:
-            # Retry logic with SLOWER intervals to avoid 429 Errors
+            # Retry logic to avoid crashes
             for attempt in range(3):
                 try:
                     response = genai.embed_content(
@@ -26,10 +26,10 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
                         task_type="retrieval_document"
                     )
                     embeddings.append(response['embedding'])
-                    time.sleep(1.5) # Wait 1.5 seconds between requests (CRITICAL FIX)
+                    time.sleep(1.0) # Wait 1 second (Rate Limit Safety)
                     break
                 except Exception as e:
-                    time.sleep(3) # If error, wait 3 seconds before retry
+                    time.sleep(2)
         return embeddings
 
 class DatabaseManager:
@@ -52,7 +52,6 @@ class DatabaseManager:
         # ChromaDB Connection
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
         
-        # USE GOOGLE FOR EMBEDDINGS (Saves RAM and fixes crash)
         self.ef = GeminiEmbeddingFunction()
         
         self.collection = self.chroma_client.get_or_create_collection(
@@ -111,8 +110,9 @@ class DatabaseManager:
 
         if not context_parts: return "No info found.", [], []
 
-        # SWITCHED TO STABLE MODEL (gemini-1.5-flash)
-        model = genai.GenerativeModel('gemini-1.5-flash-8b')
+        # --- THE CHANGE IS HERE ---
+        # Using the "8b" model (Fastest Google Model)
+        model = genai.GenerativeModel('gemini-1.5-flash-8b') 
         prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
         
         try:
@@ -120,4 +120,3 @@ class DatabaseManager:
             return response.text, retrieved_images, retrieved_tables
         except Exception as e:
             return f"AI Error: {e}", [], []
-
