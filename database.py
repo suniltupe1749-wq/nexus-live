@@ -112,7 +112,7 @@ class DatabaseManager:
         if not context_parts: return "No info found.", [], []
 
         # SWITCHED TO STABLE MODEL (gemini-1.5-flash)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash-8b')
         prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
         
         try:
@@ -120,3 +120,4 @@ class DatabaseManager:
             return response.text, retrieved_images, retrieved_tables
         except Exception as e:
             return f"AI Error: {e}", [], []
+
