@@ -14,7 +14,7 @@ import streamlit as st
 def get_clean_api_key():
     # 1. Try fetching from Streamlit Secrets (Best for Cloud)
     try:
-        key = st.secrets["GOOGLE_API_KEY"]
+        key = st.secrets["AIzaSyAqBO1T6qtzg-oHi65hdrX8HyZj7Oy6FOY"]
     except:
         # 2. Fallback to Environment Variable (Best for Local)
         key = os.getenv("GOOGLE_API_KEY")
@@ -153,3 +153,4 @@ class DatabaseManager:
             return "⚠️ Server is busy. Please wait 1 minute.", [], []
         except Exception as e:
             return f"AI Error: {e}", [], []
+
