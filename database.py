@@ -5,36 +5,31 @@ import google.generativeai as genai
 from pymongo import MongoClient
 from chromadb import Documents, EmbeddingFunction, Embeddings
 import uuid
-import random
 import streamlit as st
 
 # ==========================================
-# 1. ROBUST KEY LOADING (The Fix)
+# 1. SECURE KEY LOADING (Fixes Leaks)
 # ==========================================
-def get_clean_api_key():
-    # 1. Try fetching from Streamlit Secrets (Best for Cloud)
+def get_secure_key():
+    # Priority 1: Streamlit Cloud Secrets (Secure)
     try:
-        key = st.secrets["AIzaSyAqBO1T6qtzg-oHi65hdrX8HyZj7Oy6FOY"]
+        key = st.secrets["GOOGLE_API_KEY"]
     except:
-        # 2. Fallback to Environment Variable (Best for Local)
+        # Priority 2: Local .env file (Secure)
         key = os.getenv("GOOGLE_API_KEY")
 
     if not key:
-        print("❌ CRITICAL ERROR: No API Key found!")
         return None
+    
+    # Clean up the key (Remove spaces/quotes that cause errors)
+    return str(key).strip().replace('"', '').replace("'", "")
 
-    # 3. CLEAN THE KEY (Remove spaces and quotes)
-    # This fixes the "API_KEY_INVALID" error caused by copy-pasting
-    clean_key = str(key).strip().replace('"', '').replace("'", "")
-    return clean_key
-
-# Configure Google Gemini with the clean key
-api_key = get_clean_api_key()
+api_key = get_secure_key()
 if api_key:
     genai.configure(api_key=api_key)
 
 # ==========================================
-# 2. STRICT Rate Limit Embedding Function
+# 2. RATE LIMIT HANDLING (Prevents Crashes)
 # ==========================================
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
@@ -49,24 +44,21 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
                         task_type="retrieval_document"
                     )
                     embeddings.append(response['embedding'])
-                    time.sleep(4) # Safety timer
+                    time.sleep(3) # Wait 3s to be safe
                     break
                 except Exception as e:
-                    wait_time = (2 ** attempt) * 2
-                    print(f"⚠️ Rate Limit Hit. Cooling down for {wait_time}s...")
-                    time.sleep(wait_time)
+                    time.sleep((2 ** attempt) * 2)
         return embeddings
 
 class DatabaseManager:
     def __init__(self):
-        # MongoDB Connection
+        # Secure MongoDB Loading
         try:
-            # Try Secrets first, then Environment
             try:
                 mongo_uri = st.secrets["MONGO_URI"]
             except:
                 mongo_uri = os.getenv("MONGO_URI")
-            
+                
             if not mongo_uri: 
                 mongo_uri = "mongodb://localhost:27017/"
             
@@ -106,8 +98,8 @@ class DatabaseManager:
     def ask_ai(self, user_query):
         try:
             results = self.collection.query(query_texts=[user_query], n_results=5)
-        except Exception as e:
-            return "⚠️ Database error. Please try again.", [], []
+        except:
+            return "⚠️ Database warming up...", [], []
         
         context_parts = []
         retrieved_images = []
@@ -139,7 +131,7 @@ class DatabaseManager:
 
         if not context_parts: return "No info found.", [], []
 
-        # USE LATEST ALIAS (Fixes 404 error)
+        # --- FIX 404: Use 'gemini-flash-latest' ---
         model = genai.GenerativeModel('gemini-flash-latest')
         prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
         
@@ -150,7 +142,6 @@ class DatabaseManager:
                     return response.text, retrieved_images, retrieved_tables
                 except Exception as e:
                     time.sleep(2)
-            return "⚠️ Server is busy. Please wait 1 minute.", [], []
+            return "⚠️ Server is busy. Please wait.", [], []
         except Exception as e:
             return f"AI Error: {e}", [], []
-
