@@ -1,23 +1,77 @@
 import os
-import time  # Added for rate limiting
+import time
 import chromadb
 import google.generativeai as genai
 from pymongo import MongoClient
-from chromadb.utils import embedding_functions
-from dotenv import load_dotenv
+from chromadb import Documents, EmbeddingFunction, Embeddings
 import uuid
+import random
+import streamlit as st
 
-# Load Secrets
-# (Replace with your actual key if not using .env)
-api_key = "GOOGLE_API_KEY"
-genai.configure(api_key=api_key)
+# ==========================================
+# 1. ROBUST KEY LOADING (The Fix)
+# ==========================================
+def get_clean_api_key():
+    # 1. Try fetching from Streamlit Secrets (Best for Cloud)
+    try:
+        key = st.secrets["GOOGLE_API_KEY"]
+    except:
+        # 2. Fallback to Environment Variable (Best for Local)
+        key = os.getenv("GOOGLE_API_KEY")
+
+    if not key:
+        print("❌ CRITICAL ERROR: No API Key found!")
+        return None
+
+    # 3. CLEAN THE KEY (Remove spaces and quotes)
+    # This fixes the "API_KEY_INVALID" error caused by copy-pasting
+    clean_key = str(key).strip().replace('"', '').replace("'", "")
+    return clean_key
+
+# Configure Google Gemini with the clean key
+api_key = get_clean_api_key()
+if api_key:
+    genai.configure(api_key=api_key)
+
+# ==========================================
+# 2. STRICT Rate Limit Embedding Function
+# ==========================================
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    def __call__(self, input: Documents) -> Embeddings:
+        model = "models/embedding-001"
+        embeddings = []
+        for text in input:
+            for attempt in range(5):
+                try:
+                    response = genai.embed_content(
+                        model=model,
+                        content=text,
+                        task_type="retrieval_document"
+                    )
+                    embeddings.append(response['embedding'])
+                    time.sleep(4) # Safety timer
+                    break
+                except Exception as e:
+                    wait_time = (2 ** attempt) * 2
+                    print(f"⚠️ Rate Limit Hit. Cooling down for {wait_time}s...")
+                    time.sleep(wait_time)
+        return embeddings
 
 class DatabaseManager:
     def __init__(self):
-        # 1. MongoDB (Tables)
+        # MongoDB Connection
         try:
-            self.mongo_client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
-            self.mongo_client.server_info()
+            # Try Secrets first, then Environment
+            try:
+                mongo_uri = st.secrets["MONGO_URI"]
+            except:
+                mongo_uri = os.getenv("MONGO_URI")
+            
+            if not mongo_uri: 
+                mongo_uri = "mongodb://localhost:27017/"
+            
+            self.mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            self.mongo_client.server_info() 
             self.mongo_db = self.mongo_client["full_project_db"]
             self.table_col = self.mongo_db["tables"]
             print("✅ MongoDB Connected")
@@ -25,12 +79,9 @@ class DatabaseManager:
             print("⚠️ MongoDB not found. Tables will be text-only.")
             self.table_col = None
 
-        # 2. ChromaDB (Vectors)
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
-        self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2",
-            device="cpu"
-        )
+        self.ef = GeminiEmbeddingFunction()
+        
         self.collection = self.chroma_client.get_or_create_collection(
             name="enterprise_data",
             embedding_function=self.ef
@@ -43,18 +94,20 @@ class DatabaseManager:
     def save_table(self, html, summary, filename, page):
         mongo_id = "N/A"
         if self.table_col is not None:
-            res = self.table_col.insert_one({"html": html, "source": filename, "page": page})
-            mongo_id = str(res.inserted_id)
+            try:
+                res = self.table_col.insert_one({"html": html, "source": filename, "page": page})
+                mongo_id = str(res.inserted_id)
+            except:
+                pass
         
         meta = {"source": filename, "page": page, "type": "table", "mongo_id": mongo_id}
         self.save_chunk(f"Table Data: {summary}", meta)
 
     def ask_ai(self, user_query):
-        # Pause briefly to avoid 429 errors
-        time.sleep(1)
-
-        # Search Database
-        results = self.collection.query(query_texts=[user_query], n_results=5)
+        try:
+            results = self.collection.query(query_texts=[user_query], n_results=5)
+        except Exception as e:
+            return "⚠️ Database error. Please try again.", [], []
         
         context_parts = []
         retrieved_images = []
@@ -67,35 +120,36 @@ class DatabaseManager:
                 
                 if dtype == 'image':
                     img_path = meta.get('image_path')
-                    
-                    # --- FIX 1: Prevent Duplicate Images ---
                     if img_path not in retrieved_images:
                         retrieved_images.append(img_path)
-                        # We still add the text context so the AI knows about it
                         context_parts.append(f"[Found Image: {doc}]")
-
                 elif dtype == 'table':
                     mongo_id = meta.get('mongo_id')
                     if self.table_col is not None and mongo_id != "N/A":
                         from bson.objectid import ObjectId
-                        t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
-                        
-                        # --- FIX 2: Prevent Duplicate Tables ---
-                        if t_doc and t_doc["html"] not in retrieved_tables:
-                            retrieved_tables.append(t_doc["html"])
-                            context_parts.append(f"[Found Table: {doc}]")
+                        try:
+                            t_doc = self.table_col.find_one({"_id": ObjectId(mongo_id)})
+                            if t_doc and t_doc["html"] not in retrieved_tables:
+                                retrieved_tables.append(t_doc["html"])
+                                context_parts.append(f"[Found Table: {doc}]")
+                        except:
+                            pass
                 else:
                     context_parts.append(f"{doc}")
 
         if not context_parts: return "No info found.", [], []
 
-        # Generate Answer
+        # USE LATEST ALIAS (Fixes 404 error)
+        model = genai.GenerativeModel('gemini-flash-latest')
+        prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
+        
         try:
-            # Using 2.5 Flash as it is currently the most stable free model
-            model = genai.GenerativeModel('gemini-flash-latest')
-            prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
-            response = model.generate_content(prompt)
-            return response.text, retrieved_images, retrieved_tables
+            for attempt in range(3):
+                try:
+                    response = model.generate_content(prompt)
+                    return response.text, retrieved_images, retrieved_tables
+                except Exception as e:
+                    time.sleep(2)
+            return "⚠️ Server is busy. Please wait 1 minute.", [], []
         except Exception as e:
-            return f"Error: {e}", [], []
-
+            return f"AI Error: {e}", [], []
