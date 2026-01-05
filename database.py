@@ -51,6 +51,8 @@ class DatabaseManager:
 
         # ChromaDB Connection
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
+        
+        # USE GOOGLE FOR EMBEDDINGS (Saves RAM and fixes crash)
         self.ef = GeminiEmbeddingFunction()
         
         self.collection = self.chroma_client.get_or_create_collection(
