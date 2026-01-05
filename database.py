@@ -11,13 +11,13 @@ import random
 api_key = os.getenv("AIzaSyBUM7or5qz9DHa6I_ZezaAU0i26dIT9EDs")
 genai.configure(api_key=api_key)
 
-# 2. Smart Embedding Function (Prevents 429 Errors)
+# 2. STRICT Rate Limit Embedding Function
 class GeminiEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
         model = "models/embedding-001"
         embeddings = []
         for text in input:
-            # Try up to 5 times if Google is busy
+            # Retry loop for 429 Errors
             for attempt in range(5):
                 try:
                     response = genai.embed_content(
@@ -27,19 +27,20 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
                     )
                     embeddings.append(response['embedding'])
                     
-                    # SUCCESS: Wait 2 seconds to be safe
-                    time.sleep(2) 
+                    # CRITICAL: Wait 4 seconds between every single chunk
+                    # This prevents the "Speeding Ticket" (429)
+                    time.sleep(4) 
                     break
                 except Exception as e:
-                    # FAILURE: Wait longer each time (2s, 4s, 8s...)
-                    wait_time = (2 ** attempt) + 1
-                    print(f"⚠️ Google is busy. Waiting {wait_time} seconds...")
+                    # If we still hit a limit, wait 10, 20, 30 seconds...
+                    wait_time = (2 ** attempt) * 5
+                    print(f"⚠️ Rate Limit Hit. Cooling down for {wait_time}s...")
                     time.sleep(wait_time)
         return embeddings
 
 class DatabaseManager:
     def __init__(self):
-        # MongoDB Connection with Timeout (Prevents hanging)
+        # MongoDB Connection
         try:
             mongo_uri = os.getenv("MONGO_URI")
             if not mongo_uri: 
@@ -57,7 +58,6 @@ class DatabaseManager:
         # ChromaDB Connection
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db_store")
         
-        # Initialize the Smart Embeddings
         self.ef = GeminiEmbeddingFunction()
         
         self.collection = self.chroma_client.get_or_create_collection(
@@ -86,7 +86,7 @@ class DatabaseManager:
         try:
             results = self.collection.query(query_texts=[user_query], n_results=5)
         except Exception as e:
-            return "⚠️ Database is warming up. Please try again in 10 seconds.", [], []
+            return "⚠️ Database error. Please try again.", [], []
         
         context_parts = []
         retrieved_images = []
@@ -119,19 +119,18 @@ class DatabaseManager:
 
         if not context_parts: return "No info found.", [], []
 
-        # --- THE BEST MODEL ---
-        # Using gemini-1.5-flash (Stable, High Limits)
+        # SWITCHING BACK TO 1.5 FLASH (Most Stable for Free Tier)
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"Answer using this context:\n{chr(10).join(context_parts)}\n\nQuestion: {user_query}"
         
         try:
-            # Smart Retry for Answer Generation too
+            # Retry logic for Chat
             for attempt in range(3):
                 try:
                     response = model.generate_content(prompt)
                     return response.text, retrieved_images, retrieved_tables
                 except Exception as e:
-                    time.sleep(2)
-            return "⚠️ Server is busy. Please ask again in a moment.", [], []
+                    time.sleep(5) # Wait 5 seconds if chat fails
+            return "⚠️ Server is busy (Rate Limit). Please wait 1 minute.", [], []
         except Exception as e:
             return f"AI Error: {e}", [], []
